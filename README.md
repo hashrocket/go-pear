@@ -4,18 +4,23 @@ Pear is command line utility used while pairing to ensure that each programmer i
 
 ## Installing Pear
 
-On OSX:
+Please check out the releases page to get the latest binary for your system
 
-	$ brew tap hashrocket/formulas && brew install hashrocket/formulas/pear
+https://github.com/hashrocket/go-pear/releases
 
-For Linux we intend to be distributed via apt-get, until then, either download the latest release from github, or if you have the Go toolchain available use:
+Then copy that binary to a directory in your path.
 
-	$ make prepare
-	$ make build
-
-to compile the binary.
 
 ## Using Pear
+### Move into a git repo
+
+Pear only works inside of a git repo.  If you are outside of a git repo, you'll see an error message that looks like this:
+
+```
+> pear
+Pear only works in a git repository
+```
+
 ### Changing Pairs
 
 	$ pear chriserin derekparker
@@ -46,18 +51,6 @@ This will unset local user configuration and fall back to the global configurati
 
 Will let you setup your git configuration to reflect all the programmers that have contributed to a commit.
 
-### Changing Group/Email
-
-	$ pear --email dev@hashrocket.com
-
-OR
-
-	$ pear chriserin derekparker --email dev@hashrocket.com
-
-Will configure the email associated with commits, the programmers involved will be listed as plus delimited metadata in the email address, like:
-
-	dev+chriserin+derekparker@hashrocket.com
-
 ## How Pear works
 
 Pear works by changing your local git configuration, the configuration for a specific repository. Pear stores the full name of each developer in the ~/.pearrc so that a programmer will only be prompted once for his/her full name.
@@ -71,3 +64,33 @@ and
 	GIT_COMMITTER_EMAIL
 
 These environment variables override the details provided by the git configuration. At Hashrocket, we use "Hashrocket Workstation" as the `GIT_COMMITTER_NAME` to provide a little bit more detail about where the commit is coming from.
+
+## Github Integration
+
+Github now has its own multiple committer attribute [feature](https://help.github.com/articles/creating-a-commit-with-multiple-authors/).  `pear` is configured as a default to work with this new Github feature.  When you use pear, it will insert the following line into the `prepare-commit-msg` hook.
+
+``` sh
+pear --augment-commit-message $1 $2 $3
+```
+
+That hook manipulates your commit message to include additional committers in this format:
+
+```
+Co-authored-by: Chris Erin <chris.erin@gmail.com>
+```
+
+You can toggle this feature on and off with the `pear --github-integration` or `pear -i` option:
+
+``` sh
+pear -i on
+pear -i off
+```
+
+### About
+
+[![Hashrocket logo](https://hashrocket.com/hashrocket_logo.svg)](https://hashrocket.com)
+
+Pear is supported by the team at [Hashrocket, a multidisciplinary design and
+development consultancy](https://hashrocket.com). If you'd like to [work with
+us](https://hashrocket.com/contact-us/hire-us) or [join our
+team](https://hashrocket.com/contact-us/jobs), don't hesitate to get in touch.
