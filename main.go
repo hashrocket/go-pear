@@ -2,33 +2,39 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
-	"os/user"
+	"os/exec"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/jessevdk/go-flags"
-	"github.com/libgit2/git2go"
 	"gopkg.in/v1/yaml"
 )
 
-const version = "1.3.2"
+const version = "2.1.3.alpha"
+
+type Dev struct {
+	Name  string
+	Email string
+}
 
 type Config struct {
 	Email string
-	Devs  map[string]string
+	Devs  map[string]Dev
 }
 
 type options struct {
-	File    string `short:"f" long:"file" description:"Optional alternative git config file"`
-	Email   string `short:"e" long:"email" description:"Base author email"`
-	Global  bool   `short:"g" long:"global" description:"Modify global git settings"`
-	Unset   bool   `short:"u" long:"unset" description:"Unset local pear information"`
-	Version bool   `short:"v" long:"version" description:"Print version string"`
+	Unset       bool   `short:"u" long:"unset" description:"Unset local pear information"`
+	Version     bool   `short:"v" long:"version" description:"Print version string"`
+	Augment     bool   `short:"a" long:"augment-commit-message" description:"Used within the git hook to write Co-authors to commit message"`
+	Integration string `short:"i" long:"github-integration" description:"Takes values on or off, to turn on or off github co-author integration"`
 }
 
 func pearrcpath() string {
@@ -45,49 +51,9 @@ func parseFlags() ([]string, *options, error) {
 	return devs, opts, nil
 }
 
-func initGitConfig(opts *options) (*git.Config, error) {
-	wd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-
-	usr, err := user.Current()
-	if err != nil {
-		return nil, err
-	}
-
-	repopath, err := git.Discover(wd, false, []string{usr.HomeDir})
-	if err != nil {
-		return nil, err
-	}
-
-	repo, err := git.OpenRepository(repopath)
-	if err != nil {
-		return nil, err
-	}
-
-	gitconf, err := repo.Config()
-	if err != nil {
-		return nil, err
-	}
-
-	if opts.File != "" {
-		err = gitconf.AddFile(opts.File, git.ConfigLevelApp, false)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if opts.Global {
-		glconfpath := path.Join(usr.HomeDir, ".gitconfig")
-
-		err = gitconf.AddFile(glconfpath, git.ConfigLevelGlobal, false)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return gitconf, nil
+func inGitRepository() bool {
+	_, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").CombinedOutput()
+	return err == nil
 }
 
 func printStderrAndDie(err error) {
@@ -106,15 +72,33 @@ func main() {
 		os.Exit(0)
 	}
 
-	gitconfig, err := initGitConfig(opts)
-	if err != nil {
-		printStderrAndDie(err)
+	if !inGitRepository() {
+		fmt.Println("Pear only works in a git repository")
+		os.Exit(1)
 	}
 
-	defer gitconfig.Free()
+	if opts.Integration != "" {
+		switch opts.Integration {
+		case "on":
+			writeHook()
+			gitConfig("pear.githubIntegration", "true")
+		case "off":
+			removeHook()
+			gitConfig("pear.githubIntegration", "false")
+		default:
+			fmt.Println("Integration options must be either 'on' or 'off'")
+		}
+		os.Exit(0)
+	}
+
+	if opts.Unset {
+		removePair()
+		removeHook()
+		os.Exit(0)
+	}
 
 	if len(os.Args) == 1 {
-		fmt.Println(username(gitconfig))
+		fmt.Println(username())
 		os.Exit(0)
 	}
 
@@ -123,64 +107,194 @@ func main() {
 		printStderrAndDie(err)
 	}
 
-	sanitizeDevNames(devs)
+	if opts.Augment {
+		var revision, source string
 
-	if opts.Unset {
-		removePair(gitconfig)
+		if len(devs) == 0 {
+			log.Fatal("A file name as the first argument is required for Augment")
+		}
+
+		if len(devs) < 3 {
+			revision = ""
+		} else {
+			revision = devs[2]
+		}
+
+		if len(devs) < 2 {
+			source = ""
+		} else {
+			source = devs[1]
+		}
+
+		augmentCommitMessage(devs[0], source, revision, conf)
 		os.Exit(0)
 	}
 
+	sanitizeDevNames(devs)
+
 	var (
-		fullnames = checkPair(devs, conf)
+		devValues = checkPair(devs, conf)
 		email     = formatEmail(checkEmail(conf), devs)
 	)
 
-	setPair(email, fullnames, gitconfig)
+	setPair(email, devValues, devs)
+	if githubIntegration() {
+		writeHook()
+	}
 	savePearrc(conf, pearrcpath())
 }
 
-func username(gitconfig *git.Config) string {
-	name, err := gitconfig.LookupString("user.name")
-	if err != nil {
-		printStderrAndDie(err)
-	}
-
-	return name
+func githubIntegration() bool {
+	value, _ := gitConfig("pear.githubIntegration")
+	return strings.Trim(value, "\n ") != "false"
 }
 
-func email(gitconfig *git.Config) string {
-	email, err := gitconfig.LookupString("user.email")
+func username() string {
+	output, err := gitConfig("user.name")
 	if err != nil {
-		printStderrAndDie(err)
+		var exitCode int
+
+		if exitError, ok := err.(*exec.ExitError); ok {
+			ws := exitError.Sys().(syscall.WaitStatus)
+			exitCode = ws.ExitStatus()
+			if exitCode == 1 {
+				log.Fatal("No git user is currently set, try `git config user.name` to confirm")
+			} else {
+				log.Fatal(output, err)
+			}
+		}
 	}
 
-	return email
+	return strings.Trim(string(output), "\n ")
 }
 
-func setPair(email string, pairs []string, gitconfig *git.Config) {
-	pair := strings.Join(pairs, " and ")
-
-	err := gitconfig.SetString("user.name", pair)
+func email() string {
+	output, err := gitConfig("user.email")
 	if err != nil {
-		printStderrAndDie(err)
+		log.Fatal(err)
 	}
 
-	err = gitconfig.SetString("user.email", email)
+	return strings.Trim(string(output), "\n ")
+}
+
+func setPair(email string, pairs []Dev, devs []string) {
+
+	var fullnames []string
+
+	for _, pair := range pairs {
+		fullnames = append(fullnames, pair.Name)
+	}
+	pair := strings.Join(fullnames, " and ")
+
+	_, err := gitConfig("pear.devs", strings.Join(devs, ","))
 	if err != nil {
-		printStderrAndDie(err)
+		log.Fatal(err)
+	}
+
+	_, err = gitConfig("user.name", pair)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = gitConfig("user.email", email)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
 
-func removePair(gitconfig *git.Config) {
-	err := gitconfig.Delete("user.name")
+func getCurrentDevValues(conf *Config) []Dev {
+	var devValues []Dev
+	devs, err := gitConfig("pear.devs")
+
 	if err != nil {
-		os.Stderr.WriteString(err.Error() + "\n")
+		fmt.Println("Could not read git config for pairs")
+		log.Fatal(err)
 	}
 
-	err = gitconfig.Delete("user.email")
-	if err != nil {
-		os.Stderr.WriteString(err.Error())
+	for _, devkey := range strings.Split(devs, ",") {
+		dev, ok := conf.Devs[strings.Trim(devkey, "\n ")]
+		if !ok {
+			log.Fatal("No dev found: " + devkey)
+		}
+
+		devValues = append(devValues, dev)
 	}
+
+	return devValues
+}
+
+func removeHook() {
+	var hookBuffer bytes.Buffer
+
+	hookPath := prepareCommitHookPath()
+
+	var contents []byte
+	var err error
+
+	contents, err = ioutil.ReadFile(hookPath)
+	if err != nil {
+		contents = []byte("")
+	}
+
+	re := regexp.MustCompile("(?m)[\r\n]+^.*pear.*$")
+	replacedString := re.ReplaceAllString(string(contents), "")
+
+	hookBuffer.Write([]byte(replacedString))
+
+	err = ioutil.WriteFile(hookPath, hookBuffer.Bytes(), 0755)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func writeHook() {
+	var hookBuffer bytes.Buffer
+
+	hookPath := prepareCommitHookPath()
+
+	var contents []byte
+	var err error
+
+	contents, err = ioutil.ReadFile(hookPath)
+	if err != nil {
+		contents = []byte("")
+	}
+
+	re := regexp.MustCompile("(?m)[\r\n]+^.*pear.*$")
+	replacedString := re.ReplaceAllString(string(contents), "")
+
+	hookBuffer.Write([]byte(replacedString))
+	hookBuffer.Write([]byte("\npear --augment-commit-message $1 $2 $3\n"))
+
+	err = ioutil.WriteFile(hookPath, hookBuffer.Bytes(), 0755)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err = os.Chmod(hookPath, 0755); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func removePair() {
+	_, err := gitConfig("--unset", "user.name")
+	if err != nil {
+		if err.Error() != "exit status 5" {
+			log.Fatal(err)
+		}
+	}
+
+	_, err = gitConfig("--unset", "user.email")
+	if err != nil {
+		if err.Error() != "exit status 5" {
+			log.Fatal(err)
+		}
+	}
+}
+
+func gitConfig(args ...string) (string, error) {
+	output, err := exec.Command("git", append([]string{"config"}, args...)...).CombinedOutput()
+	return string(output), err
 }
 
 func checkEmail(conf *Config) string {
@@ -191,26 +305,63 @@ func checkEmail(conf *Config) string {
 	return conf.Email
 }
 
-func checkPair(pair []string, conf *Config) []string {
-	var fullnames []string
-	for _, dev := range pair {
-		if _, ok := conf.Devs[dev]; !ok {
-			conf.Devs[dev] = getName(dev)
+func checkPair(pair []string, conf *Config) []Dev {
+	var devValues []Dev
+
+	for _, devkey := range pair {
+		dev, ok := conf.Devs[devkey]
+
+		if !ok {
+			dev = Dev{Name: "", Email: ""}
 		}
 
-		fullnames = append(fullnames, conf.Devs[dev])
+		if nameok := dev.Name; nameok == "" {
+			dev.Name = getDevFullName(devkey)
+		}
+
+		if emailok := dev.Email; emailok == "" && githubIntegration() {
+			dev.Email = getDevEmail(devkey)
+		}
+
+		devValues = append(devValues, dev)
+
+		conf.Devs[devkey] = dev
 	}
 
-	return fullnames
+	return devValues
 }
 
-func getName(devName string) string {
-	prompt := fmt.Sprintf("Please enter a full name for %s:", devName)
+func getDevEmail(devName string) string {
+	prompt := fmt.Sprintf("Please enter an email for %s (for github integration use email associated with github):", devName)
 	return promptForInput(prompt)
 }
 
+func getDevFullName(devName string) string {
+	var devFullName string
+
+	for devFullName == "" {
+		prompt := fmt.Sprintf("Please enter a full name for %s:", devName)
+		devFullName = promptForInput(prompt)
+	}
+
+	return devFullName
+}
+
 func getEmail() string {
-	return promptForInput("Please provide base author email:")
+	var baseAuthorEmail string
+
+	re := regexp.MustCompile("^[^@]+@[^@]+$")
+
+	for baseAuthorEmail == "" || !re.MatchString(baseAuthorEmail) {
+
+		baseAuthorEmail = promptForInput("Please provide base author email:")
+
+		if !re.MatchString(baseAuthorEmail) {
+			fmt.Println("Invalid")
+		}
+	}
+
+	return baseAuthorEmail
 }
 
 func promptForInput(prompt string) string {
@@ -223,6 +374,7 @@ func promptForInput(prompt string) string {
 }
 
 func readInput() string {
+	os.Stdin.Seek(0, 0)
 	buf := bufio.NewReader(os.Stdin)
 	inputString, err := buf.ReadString('\n')
 	if err != nil {
@@ -238,7 +390,7 @@ func savePearrc(conf *Config, path string) error {
 		return err
 	}
 
-	err = ioutil.WriteFile(path, contents, os.ModeExclusive)
+	err = ioutil.WriteFile(path, contents, 0644)
 	if err != nil {
 		return err
 	}
@@ -248,7 +400,7 @@ func savePearrc(conf *Config, path string) error {
 
 func readPearrc(path string) (*Config, error) {
 	conf := &Config{
-		Devs: make(map[string]string),
+		Devs: make(map[string]Dev),
 	}
 
 	file, err := os.Open(path)
@@ -290,4 +442,46 @@ func sanitizeDevNames(devs []string) {
 	}
 
 	sort.Strings(devs)
+}
+
+func prepareCommitHookPath() string {
+	output, err := exec.Command("git", "rev-parse", "--git-dir").CombinedOutput()
+	if err != nil {
+		log.Fatal("Could not find the git dir", err)
+	}
+
+	return (strings.Trim(string(output), "\n") + "/hooks/prepare-commit-msg")
+}
+
+func augmentCommitMessage(filePath string, source string, revision string, conf *Config) {
+	pairs := getCurrentDevValues(conf)
+
+	switch source + "," + revision {
+	case ",":
+		addCoauthorsToCommitMessage(filePath, pairs)
+	case "commit,":
+		addCoauthorsToCommitMessage(filePath, pairs)
+	}
+}
+
+func addCoauthorsToCommitMessage(filePath string, pairs []Dev) {
+	contents, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var commitMessageBuffer bytes.Buffer
+	commitMessageBuffer.Write([]byte("\n\n"))
+
+	for _, dev := range pairs {
+		commitMessageBuffer.Write([]byte("Co-authored-by: "))
+		commitMessageBuffer.Write([]byte(dev.Name))
+		commitMessageBuffer.Write([]byte(" <"))
+		commitMessageBuffer.Write([]byte(dev.Email))
+		commitMessageBuffer.Write([]byte(">\n"))
+	}
+
+	commitMessageBuffer.Write(contents)
+
+	ioutil.WriteFile(filePath, commitMessageBuffer.Bytes(), 0644)
 }

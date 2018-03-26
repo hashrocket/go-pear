@@ -2,82 +2,60 @@ package main
 
 import (
 	"io/ioutil"
+	"log"
 	"os"
+	"path"
+	"strings"
 	"testing"
-
-	"github.com/libgit2/git2go"
 )
 
-func TestPear(t *testing.T) {
+func TestPearTwoDevsOneWithoutEmail(t *testing.T) {
 	mockHomeEnv("fixtures/integration")
-	tmpstdin := mockStdin(t, "Person B")
+	tmpstdin := mockStdinUser(t, "Person B", "personb@example.com")
 	tmp, oldstdout := mockStdout(t)
-	pearrc := createPearrc(t, []byte("email: foo@example.com\ndevs:\n  deva: Full Name A"))
+	pearrc := createPearrc(t, []byte("email: foo@example.com\ndevs:\n  deva:\n    name: Full Name A"))
+
 	defer func() {
 		cleanupStdout(t, tmp, oldstdout)
 		closeFile(tmpstdin)
 		closeFile(pearrc)
 	}()
 
-	os.Args = []string{"pear", "DevB", "DevA", "--file", "fixtures/test.config"}
+	withinStubRepo(t, "foo", func() {
+		os.Args = []string{"pear", "DevB", "DevA"}
 
-	main()
+		main()
 
-	conf, err := readPearrc("fixtures/integration/.pearrc")
-	if err != nil {
-		t.Error(err)
-	}
+		conf, err := readPearrc(path.Join(os.Getenv("HOME"), ".pearrc"))
+		if err != nil {
+			t.Error(err)
+		}
 
-	if len(conf.Devs) != 2 {
-		t.Error("Devs were not recorded")
-	}
+		if len(conf.Devs) != 2 {
+			t.Error("Devs were not recorded")
+		}
 
-	expectedUser := "Full Name A and Person B"
-	gitconfig := initTestGitConfig("fixtures/test.config", t)
-	actualUser := username(gitconfig)
-	if actualUser != expectedUser {
-		t.Errorf("Expected %s got %s", expectedUser, actualUser)
-	}
+		expectedUser := "Full Name A and Person B"
 
-	expectedEmail := "foo+deva+devb@example.com"
-	actualEmail := email(gitconfig)
-	if actualEmail != expectedEmail {
-		t.Errorf("Expected %s got %s", expectedEmail, actualEmail)
-	}
-}
+		actualUser := username()
 
-func TestPearOneDevNoSavedEmail(t *testing.T) {
-	mockHomeEnv("fixtures/integration")
-	tmpstdin := mockStdin(t, "dev@pear.biz")
-	tmp, oldstdout := mockStdout(t)
+		if actualUser != expectedUser {
+			t.Errorf("Expected %s got %s", expectedUser, actualUser)
+		}
 
-	pearrc := createPearrc(t, []byte("devs:\n  dev1: Full Name A"))
-	defer func() {
-		cleanupStdout(t, tmp, oldstdout)
-		closeFile(tmpstdin)
-		closeFile(pearrc)
-	}()
-
-	os.Args = []string{"pear", "dev1", "--email", "foo@biz.net", "--file", "fixtures/test.config"}
-
-	main()
-
-	readConf, err := readPearrc("fixtures/integration/.pearrc")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if readConf.Email != "dev@pear.biz" {
-		t.Error("Email was not saved.")
-	}
+		expectedEmail := "foo+deva+devb@example.com"
+		actualEmail := email()
+		if actualEmail != expectedEmail {
+			t.Errorf("Expected %s got %s", expectedEmail, actualEmail)
+		}
+	})
 }
 
 func TestPearWithinSubdirectory(t *testing.T) {
-	mockHomeEnv("fixtures/integration")
-	pearrc := createPearrc(t, []byte("email: foo@example.com\ndevs:\n  deva: Full Name A\n  devb: Full Name B"))
+	pearrc := createPearrc(t, []byte("email: foo@example.com\ndevs:\n  deva:\n    name: Full Name A\n    email: a@a.com\n  devb:\n    name: Full Name B\n    email: b@b.com"))
 	defer closeFile(pearrc)
 
-	withinStubRepo(t, "foo", func(conf *git.Config) {
+	withinStubRepo(t, "foo", func() {
 		err := os.MkdirAll("bar", os.ModePerm|os.ModeExclusive|os.ModeDir)
 		if err != nil {
 			t.Fatal(err)
@@ -91,10 +69,8 @@ func TestPearWithinSubdirectory(t *testing.T) {
 		os.Args = []string{"pear", "DevB", "DevA"}
 		main()
 
-		conf.Refresh()
-
 		expected := "Full Name A and Full Name B"
-		if usr := username(conf); usr != expected {
+		if usr := username(); usr != expected {
 			t.Errorf("Expected %s, got %s", expected, usr)
 		}
 	})
@@ -104,7 +80,7 @@ func TestCheckEmail(t *testing.T) {
 	conf := Config{}
 
 	mockHomeEnv("fixtures/integration")
-	tempstdin := mockStdin(t, "dev@pear.biz")
+	tempstdin := mockStdinEmail(t, "dev@pear.biz")
 	tmp, oldstdout := mockStdout(t)
 	pearrc := createPearrc(t, []byte("devs:\n  dev1: Full Name A"))
 
@@ -137,35 +113,42 @@ func TestCheckEmail(t *testing.T) {
 }
 
 func TestSetPairWithOneDev(t *testing.T) {
-	gitconfig := initTestGitConfig("fixtures/test.config", t)
+	withinStubRepo(t, "foo", func() {
+		setPair("foo@example.com", []Dev{Dev{Name: "user1", Email: "email1"}}, []string{"user1"})
+		expected := "user1"
+		actual := username()
 
-	setPair("foo@example.com", []string{"user1"}, gitconfig)
-	expected := "user1"
-	actual := username(gitconfig)
-
-	if actual != expected {
-		t.Errorf("Expected %s got %s", expected, actual)
-	}
+		if actual != expected {
+			t.Errorf("Expected %s got %s", expected, actual)
+		}
+	})
 }
 
 func TestSetPairWithTwoDevs(t *testing.T) {
-	pair := []string{"user1", "user2"}
-	formattedEmail := formatEmail("dev@example.com", pair)
-	gitconfig := initTestGitConfig("fixtures/test.config", t)
+	withinStubRepo(t, "foo", func() {
+		pair := []string{"user1", "user2"}
 
-	setPair(formattedEmail, pair, gitconfig)
-	expectedUser := "user1 and user2"
-	actualUser := username(gitconfig)
-	expectedEmail := "dev+user1+user2@example.com"
-	actualEmail := email(gitconfig)
+		devValues := []Dev{
+			Dev{Name: "user1"},
+			Dev{Name: "user2"},
+		}
 
-	if actualUser != expectedUser {
-		t.Errorf("Expected %s got %s", expectedUser, actualUser)
-	}
+		formattedEmail := formatEmail("dev@example.com", pair)
 
-	if actualEmail != expectedEmail {
-		t.Errorf("Expected %s got %s", expectedEmail, actualEmail)
-	}
+		setPair(formattedEmail, devValues, []string{"user1", "user2"})
+		expectedUser := "user1 and user2"
+		actualUser := username()
+		expectedEmail := "dev+user1+user2@example.com"
+		actualEmail := email()
+
+		if actualUser != expectedUser {
+			t.Errorf("Expected %s got %s", expectedUser, actualUser)
+		}
+
+		if actualEmail != expectedEmail {
+			t.Errorf("Expected %s got %s", expectedEmail, actualEmail)
+		}
+	})
 }
 
 func TestReadPearrc(t *testing.T) {
@@ -185,9 +168,9 @@ func TestReadPearrc(t *testing.T) {
 }
 
 func TestSavePearrc(t *testing.T) {
-	expected := map[string]string{
-		"dparker":   "Derek Parker",
-		"chriserin": "Chris Erin",
+	expected := map[string]Dev{
+		"dparker":   Dev{Name: "Derek Parker"},
+		"chriserin": Dev{Name: "Chris Erin"},
 	}
 
 	conf := Config{
@@ -220,12 +203,12 @@ func TestCheckPairWithUnknownDev(t *testing.T) {
 	expectedFullName := "Person B"
 	pair := []string{"knowndev", "newdev"}
 	conf := &Config{
-		Devs: map[string]string{
-			"knowndev": "Known Dev",
+		Devs: map[string]Dev{
+			"knowndev": Dev{Name: "Known Dev", Email: "knowndev@example.com"},
 		},
 	}
 
-	tmpstdin := mockStdin(t, "Person B")
+	tmpstdin := mockStdinUser(t, "Person B", "personb@example.com")
 	tmp, oldstdout := mockStdout(t)
 	defer func() {
 		cleanupStdout(t, tmp, oldstdout)
@@ -238,21 +221,12 @@ func TestCheckPairWithUnknownDev(t *testing.T) {
 		t.Error(err)
 	}
 
-	output, err := ioutil.ReadAll(tmp)
-	if err != nil {
-		t.Error("Could not read from temp file")
-	}
-
-	if string(output) != "Please enter a full name for newdev:\n" {
-		t.Errorf("Question output was incorrect, got: %v", string(output))
-	}
-
 	fullName, ok := conf.Devs["newdev"]
 	if !ok {
 		t.Error("Dev was not found in conf")
 	}
 
-	if fullName != expectedFullName {
+	if fullName.Name != expectedFullName {
 		t.Errorf("Expected %s got %s", expectedFullName, fullName)
 	}
 }
@@ -275,4 +249,88 @@ func TestEmailFormat(t *testing.T) {
 			t.Errorf("Expected %s, got %s", test.expected, actual)
 		}
 	}
+}
+
+func TestAppendCommitMessageAugmentation(t *testing.T) {
+	withinStubRepo(t, "foo", func() {
+		err := ioutil.WriteFile(".git/config", []byte("[pear]\n\tdevs = mattpolito\n"), os.ModeExclusive)
+		var revision string
+		messageSource := "commit"
+
+		commitMessageFile, _ := ioutil.TempFile("", "")
+		commitMessageFile.WriteString("abc123")
+		commitMessageFile.Close()
+
+		defer os.Remove(commitMessageFile.Name())
+
+		devs := map[string]Dev{
+			"mattpolito": Dev{Name: "Matt Polito", Email: "matt.polito@gmail.com"},
+		}
+
+		conf := &Config{
+			Devs: devs,
+		}
+
+		augmentCommitMessage(
+			commitMessageFile.Name(),
+			messageSource,
+			revision,
+			conf,
+		)
+
+		contents, err := ioutil.ReadFile(commitMessageFile.Name())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if !strings.Contains(string(contents), "Co-authored-by: Matt Polito <matt.polito@gmail.com>") {
+			t.Error("The Co-author line was not included in the commit message")
+		}
+
+		if !strings.Contains(string(contents), "abc123") {
+			t.Error("The existing contents were replaced")
+		}
+	})
+}
+
+func TestAppendCommitMessageAugmentationWithMerge(t *testing.T) {
+	withinStubRepo(t, "foo", func() {
+		err := ioutil.WriteFile(".git/config", []byte("[pear]\n\tdevs = mattpolito\n"), os.ModeExclusive)
+		var revision string
+		messageSource := "merge"
+
+		commitMessageFile, _ := ioutil.TempFile("", "")
+		commitMessageFile.WriteString("abc123")
+		commitMessageFile.Close()
+
+		defer os.Remove(commitMessageFile.Name())
+
+		devs := map[string]Dev{
+			"mattpolito": Dev{Name: "Matt Polito", Email: "matt.polito@gmail.com"},
+		}
+
+		conf := &Config{
+			Devs: devs,
+		}
+
+		augmentCommitMessage(
+			commitMessageFile.Name(),
+			messageSource,
+			revision,
+			conf,
+		)
+
+		contents, err := ioutil.ReadFile(commitMessageFile.Name())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if strings.Contains(string(contents), "Co-authored-by: Matt Polito <matt.polito@gmail.com>") {
+			t.Error("The Co-author line was not included in the commit message")
+		}
+
+		if !strings.Contains(string(contents), "abc123") {
+			t.Error("The existing contents were replaced")
+		}
+	})
 }

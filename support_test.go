@@ -2,14 +2,14 @@ package main
 
 import (
 	"io/ioutil"
+	"log"
 	"os"
+	"os/exec"
 	"path"
 	"testing"
-
-	"github.com/libgit2/git2go"
 )
 
-type repoTestFunc func(conf *git.Config)
+type repoTestFunc func()
 
 func withinStubRepo(t *testing.T, repoPath string, repoTest repoTestFunc) {
 	cwd, err := os.Getwd()
@@ -17,23 +17,21 @@ func withinStubRepo(t *testing.T, repoPath string, repoTest repoTestFunc) {
 		t.Fatal(err)
 	}
 
-	conf, err := initializeRepo(repoPath)
-	if err != nil {
-		t.Fatal(err)
-	}
+	initializeRepo(repoPath)
 	defer os.RemoveAll(repoPath)
 
 	err = os.Chdir(repoPath)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		err = os.Chdir(cwd)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}()
 
-	repoTest(conf)
-
-	err = os.Chdir(cwd)
-	if err != nil {
-		t.Fatal(err)
-	}
+	repoTest()
 }
 
 func mockHomeEnv(dir string) {
@@ -56,38 +54,20 @@ func mockHomeEnv(dir string) {
 	os.Setenv("HOME", dir)
 }
 
-func initializeRepo(p string) (*git.Config, error) {
-	repo, err := git.InitRepository(p, true)
+func initializeRepo(p string) error {
+	cmd := exec.Command("git", "init", p)
+	err := cmd.Run()
 	if err != nil {
-		return nil, err
+		log.Fatal(err)
 	}
 
-	conf, err := repo.Config()
-	if err != nil {
-		return nil, err
-	}
-
-	return conf, nil
+	return err
 }
 
 func closeFile(f *os.File) {
 	name := f.Name()
 	f.Close()
 	os.Remove(name)
-}
-
-func initTestGitConfig(path string, t *testing.T) *git.Config {
-	gitconfig, err := git.NewConfig()
-	if err != nil {
-		t.Error(err)
-	}
-
-	err = gitconfig.AddFile(path, git.ConfigLevelHighest, false)
-	if err != nil {
-		t.Error(err)
-	}
-
-	return gitconfig
 }
 
 func createPearrc(t *testing.T, contents []byte) *os.File {
@@ -101,19 +81,40 @@ func createPearrc(t *testing.T, contents []byte) *os.File {
 	_, err = f.Write(contents)
 	if err != nil {
 		os.Stdout = os.Stderr
-		t.Fatal("Could not write to .pearrc %s", err)
+		t.Fatalf("Could not write to .pearrc %s", err)
 	}
 
 	return f
 }
 
-func mockStdin(t *testing.T, contents string) *os.File {
+func mockStdinUser(t *testing.T, fullName string, email string) *os.File {
 	tmp, err := ioutil.TempFile("", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = tmp.WriteString(contents + "\n")
+	_, err = tmp.WriteString(fullName + "\n" + email + "\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tmp.Seek(0, os.SEEK_SET)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	os.Stdin = tmp
+
+	return tmp
+}
+
+func mockStdinEmail(t *testing.T, email string) *os.File {
+	tmp, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = tmp.WriteString(email + "\n")
 	if err != nil {
 		t.Fatal(err)
 	}
